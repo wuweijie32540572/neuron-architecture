@@ -22,7 +22,7 @@ wheels/
 .ipynb_checkpoints
 
 *.json
-!.github/workflows/*.json
+!.github/
 
 .trae/
 .idea/
@@ -32,3 +32,10 @@ wheels/
 
 *.log
 *.tmp
+
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+config/local.*
