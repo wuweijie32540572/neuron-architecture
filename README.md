@@ -59,29 +59,35 @@ system.consolidate(n_replay=80)
 
 ## Key Results
 
+### Rigorous Comparison (Mean ± Std, 5 runs)
+
+**8-Function Regression Task**:
+
+| Method | Average MSE | Description |
+|--------|-------------|-------------|
+| Standard MLP (BP) | **0.0454 ± 0.0048** | Full backpropagation training |
+| Pure Local Learning | 0.4120 ± 0.0067 | No BP pretraining, local rules only |
+| Two-Stage Training | **0.1326 ± 0.0114** | BP pretrain + local finetune |
+
+**Key Finding**: Two-stage training achieves **67.8% lower MSE** than pure local learning, while using BP only for initialization.
+
+**Note on "98.1% improvement"**: This was compared to a random-initialized local learning baseline (MSE=6.64). The rigorous comparison above uses proper baselines.
+
+### Sequential MNIST (Continual Learning)
+
+| Method | Task1 Initial | Task1 Final | Forgetting |
+|--------|---------------|-------------|------------|
+| Vanilla MLP | 99.5% | 0.0% | 99.5% |
+| Experience Replay | 99.5% | 95.4% | **4.0%** |
+| HM-Neuron | 99.8% | 92.7% | **7.1%** |
+
+### Other Results
+
 | Experiment | Result |
 |------------|--------|
-| Two-stage training vs pure local | **98.1% improvement** |
-| HM forgetting mitigation | **143.9 pp reduction** |
 | Symbol recognition confidence | **0.987** (vs 0.25 random) |
-| DA explore/exploit | **Correct tradeoff** |
-| Integrated system (197K params) | **Validated** |
-| **Sequential MNIST (800K params)** | **95.4pp forgetting reduction** |
-
-### Real Model Validation
-
-在真实MNIST数据集上验证持续学习能力：
-
-| Method | Task1 Initial | Task1 Final | Forgetting | Improvement |
-|--------|---------------|-------------|------------|-------------|
-| Vanilla MLP | 99.5% | 0.0% | 99.5% | - |
-| Experience Replay | 99.5% | 95.4% | 4.0% | **+95.4pp** |
-| HM-Neuron | 99.8% | 92.7% | 7.1% | **+92.4pp** |
-
-运行实验：
-```bash
-python experiments/sequential_mnist_2m_v2.py
-```
+| DA explore/exploit | Correct tradeoff |
+| Integrated system (197K params) | Validated |
 
 ## Documentation
 
@@ -150,9 +156,36 @@ gate = 0.4·DA + 0.2·5HT + 0.2·ACh + 0.2·NE
 
 ## Limitations
 
-1. **HM insufficient for strong interference**: +194.8% forgetting on 8 orthogonal tasks
-2. **Task similarity affects results**: Performance varies with task orthogonality
-3. **Scale limited**: Only tested up to 197K parameters
+1. **BP pretraining required**: Two-stage training uses BP for initialization (not purely local)
+2. **HM insufficient for strong interference**: +194.8% forgetting on 8 orthogonal tasks
+3. **Task similarity affects results**: Performance varies with task orthogonality
+4. **Scale limited**: Only tested up to 197K parameters
+
+## Related Work & References
+
+This project builds on the following foundational work:
+
+### Local Learning & Feedback Alignment
+- **Lillicrap, T. P., et al. (2016)**. "Random synaptic feedback weights support error backpropagation for deep learning." *Nature Communications*. [DOI:10.1038/ncomms13276](https://doi.org/10.1038/ncomms13276)
+  - Shows that random feedback weights can approximate backpropagation, supporting biological plausibility of local learning.
+
+### Continual Learning
+- **Kirkpatrick, J., et al. (2017)**. "Overcoming catastrophic forgetting in neural networks." *PNAS*. [DOI:10.1073/pnas.1611835114](https://doi.org/10.1073/pnas.1611835114)
+  - Introduces Elastic Weight Consolidation (EWC) for mitigating catastrophic forgetting.
+- **McClelland, J. L., et al. (1995)**. "Why there are complementary learning systems in the hippocampus and neocortex." *Psychological Review*.
+  - Complementary Learning Systems (CLS) theory underlying our HM-Neuron design.
+
+### Predictive Coding
+- **Friston, K. (2010)**. "The free-energy principle: a unified brain theory?" *Nature Reviews Neuroscience*. [DOI:10.1038/nrn2787](https://doi.org/10.1038/nrn2787)
+  - Free energy principle underlying our PC-Neuron design.
+
+### Neuromodulation
+- **Schultz, W., et al. (1997)**. "A neural substrate of prediction and reward." *Science*. [DOI:10.1126/science.9358056](https://doi.org/10.1126/science.9358056)
+  - Dopamine as reward prediction error, underlying our NG-Neuron DA dynamics.
+
+### Spiking Neural Networks
+- **Roy, K., et al. (2019)**. "Towards spike-based machine intelligence with neuromorphic computing." *Nature*. [DOI:10.1038/s41586-019-1677-2](https://doi.org/10.1038/s41586-019-1677-2)
+  - Overview of neuromorphic computing and spike-based computation.
 
 ## Future Directions
 
