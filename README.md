@@ -20,6 +20,16 @@ cd neuron-architecture
 pip install -e .
 ```
 
+## One-Click Reproduction
+
+一键复现所有实验结果：
+
+```bash
+python run_all_experiments.py
+```
+
+输出保存到 `results/experiment_report.json`。
+
 ## Quick Start
 
 ```python
@@ -67,6 +77,7 @@ system.consolidate(n_replay=80)
 
 See [examples/](examples/) directory:
 - `quickstart.py` - Basic usage examples
+- `demo.ipynb` - Jupyter notebook with visualizations (forgetting curves, spike rates)
 
 ## Testing
 
