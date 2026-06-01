@@ -45,17 +45,20 @@ class SIGReg(nn.Module):
             正则化损失
         """
         batch_size = z1.size(0)
+        dim = z1.size(1)
         
         z1 = z1 - z1.mean(dim=0)
         z2 = z2 - z2.mean(dim=0)
         
-        cov = (z1.T @ z2) / (batch_size - 1 + self.eps)
+        z1 = z1 / (z1.std(dim=0) + self.eps)
+        z2 = z2 / (z2.std(dim=0) + self.eps)
         
-        if cov.size(0) > 1:
-            off_diag = cov.flatten()[:-1].view(cov.size(0) - 1, cov.size(0) + 1)[:, 1:]
-            loss = off_diag.pow(2).sum()
-        else:
-            loss = torch.tensor(0.0, device=z1.device)
+        cov = (z1.T @ z2) / batch_size
+        
+        on_diag = torch.diagonal(cov).pow(2).sum()
+        off_diag = cov.pow(2).sum() - on_diag
+        
+        loss = off_diag / (dim * dim)
         
         return loss
 
