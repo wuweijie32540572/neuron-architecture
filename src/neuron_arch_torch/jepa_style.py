@@ -97,7 +97,7 @@ class JEPAPredictiveCoder(nn.Module):
         input_dim: int,
         hidden_dim: int = 256,
         latent_dim: int = 128,
-        momentum: float = 0.996,
+        momentum: float = 0.99,
         sigreg_weight: float = 0.1,
         device: str = 'auto'
     ):
