@@ -301,6 +301,60 @@ Grounding范数:
 
 ---
 
+## 真实模型验证 (2M参数 Sequential MNIST)
+
+### 实验设置
+
+- **模型规模**: ~800K参数 (MLP: 512-512-256)
+- **数据集**: MNIST (真实手写数字)
+- **任务划分**:
+  - 任务1: 数字 0-4 (30,592 训练样本)
+  - 任务2: 数字 5-9 (29,408 训练样本)
+- **训练**: 每任务5 epochs
+- **对比方法**: Vanilla、Experience Replay、HM-Neuron
+
+### 结果
+
+```
+方法                        任务1初始    任务1最终    遗忘率      缓解效果
+-------------------------------------------------------------------------
+Vanilla MLP               0.9947       0.0000       99.5%       -
+Experience Replay         0.9947       0.9543       4.0%        +95.4pp
+HM-Neuron                 0.9979       0.9272       7.1%        +92.4pp
+```
+
+### 关键发现
+
+**经验重放极其有效**:
+
+在真实MNIST数据上，经验重放将灾难性遗忘从99.5%降到4.0%，缓解效果达95.4个百分点。
+
+**HM-Neuron同样有效**:
+
+HM-Neuron配合记忆重放，将遗忘率降到7.1%，缓解效果92.4个百分点。
+
+**与合成任务的对比**:
+
+| 任务类型 | 遗忘率(Vanilla) | 遗忘率(Replay) | 缓解效果 |
+|----------|-----------------|----------------|----------|
+| 合成正交任务 | +194.8% | - | HM不足 |
+| 真实MNIST | 99.5% | 4.0% | +95.4pp |
+
+真实任务上效果更好的原因：
+1. MNIST数字并非完全正交，存在特征共享
+2. 经验重放提供了真实的旧任务数据
+3. MLP架构比SCH+PC更适合图像分类
+
+### 运行实验
+
+```bash
+python experiments/sequential_mnist_2m_v2.py
+```
+
+结果保存到 `results/sequential_mnist_2m_v2.json`
+
+---
+
 ## 实验可复现性
 
 ### 随机种子
@@ -311,6 +365,7 @@ Grounding范数:
 np.random.seed(42)  # 主实验
 np.random.seed(42 + task_id)  # 任务数据
 np.random.seed(123)  # 异常检测
+torch.manual_seed(42)  # PyTorch实验
 ```
 
 ### 结果文件
@@ -321,4 +376,5 @@ mvp_v5_1_hm_results.json   # v5.1实验结果
 mvp_v6_1_ng_esb_results.json  # v6.1实验结果
 mvp_v6_2_da_results.json   # v6.2实验结果
 mvp_v7_integrated_results.json  # v7实验结果
+results/sequential_mnist_2m_v2.json  # 真实模型结果
 ```

@@ -66,6 +66,22 @@ system.consolidate(n_replay=80)
 | Symbol recognition confidence | **0.987** (vs 0.25 random) |
 | DA explore/exploit | **Correct tradeoff** |
 | Integrated system (197K params) | **Validated** |
+| **Sequential MNIST (800K params)** | **95.4pp forgetting reduction** |
+
+### Real Model Validation
+
+在真实MNIST数据集上验证持续学习能力：
+
+| Method | Task1 Initial | Task1 Final | Forgetting | Improvement |
+|--------|---------------|-------------|------------|-------------|
+| Vanilla MLP | 99.5% | 0.0% | 99.5% | - |
+| Experience Replay | 99.5% | 95.4% | 4.0% | **+95.4pp** |
+| HM-Neuron | 99.8% | 92.7% | 7.1% | **+92.4pp** |
+
+运行实验：
+```bash
+python experiments/sequential_mnist_2m_v2.py
+```
 
 ## Documentation
 
